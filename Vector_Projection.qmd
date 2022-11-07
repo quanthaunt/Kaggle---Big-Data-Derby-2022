@@ -1,0 +1,387 @@
+---
+title: "BDD Vector Projection"
+format: html
+editor: visual
+---
+
+## Introduction
+
+Trakus data provide us with latitude and longitude coordinates of individual horses within a race. Whlst this is incredibly useful, giving us the absolute positions of the horses relative to one another, it does not tell us where they are relative to the track on which they are racing. In this file we use vector projection to calculate where the horses are relative to the track, allowing us to calculate who is in the lead at any point in time in the race. Once complete this vector projection allows us to work out where horses are relative to each other and the track, enabling deeper study of jockey tactics such as drafting.
+
+## Data Preparation
+
+```{r}
+library(mosaic)
+library(TRAMPR)
+library(tidyverse)
+
+#| label: load-packages-rawdata
+#| include: false
+
+col_names <- c("track_id",
+               "race_date",
+               "race_number",
+               "program_number",
+               "trakus_index",
+               "latitude",
+               "longitude",
+               "distance_id",
+               "course_type",
+               "track_condition",
+               "run_up_distance",
+               "race_type",
+               "purse",
+               "post_time",
+               "weight_carried",
+               "jockey",
+               "odds",
+               "position_at_finish")
+
+rawdata <- read_csv("Data/nyra_2019_complete.csv", col_names = col_names)
+
+
+```
+
+For this specific task, we are only interested in trakus and race information
+
+```{r}
+
+#| label: tidy-data
+
+intdata <- rawdata %>%
+  select(track_id, race_date, race_number, program_number, trakus_index, latitude, longitude, position_at_finish) %>%
+  mutate(raceID = paste(track_id, race_date, race_number, sep = "_")) %>%
+  select(raceID, program_number, trakus_index, latitude, longitude, position_at_finish)
+```
+
+Demonstrate on an example race
+
+```{r}
+#set.seed(42)
+sample_race <- sample(intdata$raceID, 1)
+
+sample_data <- intdata %>%
+  filter(raceID == sample_race)
+```
+
+At each point in time we know where each horse is in space from their latitude and longitude coordinates. However, we do not know where they are relative to the track. However, by taking a numerical differential in time of their positions we can calculate their displacement, i.e the difference in latitude $d(lat)$ and difference in longitude $d(long)$ between time t = t~1~ and t = t~i~. Over a small time frame this displacement can be approximated as their instantaneous velocity, as a vector, with components in the latitude and longitude directions. Over any short period of time we cannot be sure that a single horse will be moving directly along the track, i.e. directly towards the finish line. This is because they may move laterally to the direction of the track as they vie for position etc. However, we can assume that the mean displacement of all horses over a short time period will give us a very good approximation of the direction of the track at that point, again as a single vector.
+
+```{r}
+vector_proj_track <- function(dlat, dlong, mean_dlat, mean_dlong) {
+  
+  disp <- c(dlat, dlong)
+  meandisp <- c(mean_dlat, mean_dlong)
+  
+  proj <- as.vector((disp %*% meandisp) / (meandisp %*% meandisp)) * meandisp
+  
+  return (as.list(proj))
+}
+
+vector_proj_ortho <- function(dlat, dlong, projw1) {
+  
+  disp <- c(dlat, dlong)
+  w1 <- c(projw1[[1]], projw1[[2]])
+  
+  proj_ortho <- disp - w1
+  
+  return(proj_ortho)
+}
+
+scalar_proj_track <- function(dlat, dlong, mean_dlat, mean_dlong) {
+  
+  disp <- c(dlat, dlong)
+  meandisp <- c(mean_dlat, mean_dlong)
+  
+  scalproj <- as.double((disp %*% meandisp) / sqrt(sum(meandisp^2)))
+  
+  return(scalproj)
+}
+```
+
+```{r}
+#| label: distance_funcs
+## function to convert degrees to radians
+
+rad <- function(x){
+  (x*pi)/180
+}
+
+# calculate euclidean distance 
+
+euclid_dist  <- function(lat1, long1, lat2, long2){
+  
+  lat1 <- rad(lat1)
+  long1 <- rad(long1)
+  
+  #accommodate list and vectors for coord2
+  lat2 <- rad(lat2)
+  long2 <- rad(long2)
+  
+  #### convert spherical coord to planar
+  
+  # find middle of radian between latitudes for longitudinal correction
+  
+  phi_mid <- (lat1+lat2)/2
+  
+  #distance between longitudes (x) depends on latitude so transform to get euclidean using r*cos(theta) and r = delta(long) by unit circle relationship
+  
+  x <- (long2 - long1) * cos(phi_mid)
+  y <- lat2 - lat1
+  
+  ## by pythagoras theorem and scale by radius of earth ~ 6371 Km
+  
+  R_e <- 6371
+  d <- R_e*sqrt(x^2+y^2) * 1000
+  
+  return(d)
+}
+
+
+```
+
+```{r}
+dt <- 2
+
+distance <- sample_data %>%
+  arrange(program_number, trakus_index) %>%
+  mutate(prev_lat = ifelse(trakus_index <= dt, latitude, lag(latitude, dt)),
+         prev_long = ifelse(trakus_index <= dt, longitude, lag(longitude, dt)),
+         dlat = latitude - prev_lat,
+         dlong = longitude - prev_long) %>%
+  group_by(trakus_index, .drop = FALSE) %>%
+  mutate(mean_lat = mean(latitude),
+         mean_long = mean(longitude),
+         mean_dlat = mean(dlat),
+         mean_dlong = mean(dlong)) %>%
+  ungroup() %>%
+  mutate(deltalat = latitude - mean_lat,
+         deltalong = longitude - mean_long) %>%
+  rowwise() %>%
+  mutate(w1 = list(vector_proj_track(deltalat, deltalong, mean_dlat, mean_dlong)),
+         w2 = list(vector_proj_ortho(deltalat, deltalong, w1)),
+         w1dist = scalar_proj_track(deltalat, deltalong, mean_dlat, mean_dlong)) %>%
+  ungroup() %>%
+  mutate(meanqtr = case_when(mean_dlong > 0 & mean_dlat > 0 ~ "NE",
+                             mean_dlong < 0 & mean_dlat > 0 ~ "NW",
+                             mean_dlong < 0 & mean_dlat < 0 ~ "SW",
+                             mean_dlong > 0 & mean_dlat < 0 ~ "SE")) %>%
+  rowwise() %>%
+  mutate(orthoqtr = case_when(w2[[2]] > 0 & w2[[1]] > 0 ~ "NE",
+                             w2[[2]] < 0 & w2[[1]] > 0 ~ "NW",
+                             w2[[2]] < 0 & w2[[1]] < 0 ~ "SW",
+                             w2[[2]] > 0 & w2[[1]] < 0 ~ "SE")) %>%
+  mutate(distacross = sqrt(w2[[1]]^2 + w2[[2]]^2),
+         w1_lat = w1[[1]],
+         w1_long = w1[[2]],
+         w2_lat = w2[[1]],
+         w2_long = w2[[2]]) %>%
+  ungroup() %>%
+  mutate(left = case_when(meanqtr == "NE" & orthoqtr == "NW" ~ TRUE,
+                          meanqtr == "NW" & orthoqtr == "SW" ~ TRUE,
+                          meanqtr == "SW" & orthoqtr == "SE" ~ TRUE,
+                          meanqtr == "SE" & orthoqtr == "NE" ~ TRUE, 
+                          T ~ FALSE),
+         distacross = ifelse(left, distacross, 0 - distacross)) %>%
+  group_by(trakus_index) %>%
+  mutate(currentpos = rank(desc(w1dist))) %>%
+  ungroup() %>%
+  mutate(dist_travelled = euclid_dist(prev_lat, prev_long, latitude, longitude),
+         speed = dist_travelled / (dt/4),
+         dist_race = euclid_dist(mean_lat + w1_lat, mean_long + w1_long, mean_lat, mean_long),
+         dist_race = ifelse(w1dist < 0, 0 - dist_race, dist_race),
+         dist_across = euclid_dist(mean_lat + w2_lat, mean_long + w2_long, mean_lat, mean_long),
+         dist_across = ifelse(distacross < 0, 0 - dist_across, dist_across)) %>%
+  group_by(raceID, program_number) %>%
+  mutate(cumdist_travelled = cumsum(dist_travelled)) %>%
+  ungroup() %>%
+  select(raceID, program_number, trakus_index, currentpos, dist_travelled, cumdist_travelled, speed, dist_race, dist_across)
+```
+
+```{r}
+
+```
+
+```{r}
+test <- distance %>%
+  select(trakus_index, mean_dlat, mean_dlong) %>%
+  pivot_longer(cols = c("mean_dlat", "mean_dlong"), names_to = "type")
+
+ggplot(test, aes(x = trakus_index, y = value, col = type)) +
+  geom_point()
+```
+
+```{r}
+
+testdata <- distance %>%
+  filter(trakus_index == 310) %>%
+  mutate(currentpos = rank(desc(w1dist))) %>%
+  rowwise() %>%
+  mutate(w1dlong = w1[[2]],
+         w1dlat = w1[[1]],
+         w2dlong = w2[[2]],
+         w2dlat = w2[[1]])
+
+interrogate <- distance %>%
+  select(trakus_index, program_number, position_at_finish, currentpos)
+
+ggplot(testdata, aes(x = longitude, y = latitude, col = as.factor(currentpos))) +
+  geom_point() +
+  geom_point(aes(x = mean_long, y = mean_lat), col = "black") +
+  geom_point(aes(x = mean_long + mean_dlong, y = mean_lat + mean_dlat), col = "black", shape = "square") +
+  geom_segment(aes(x = mean_long, xend = mean_long + w2dlong,
+                   y = mean_lat, yend = mean_lat + w2dlat),
+               linetype = "dashed") +
+  geom_segment(aes(x = mean_long, xend = mean_long + mean_dlong, 
+                   y = mean_lat, yend = mean_lat + mean_dlat),
+               arrow = arrow(), col = "black")  +
+  geom_segment(aes(x = mean_long, xend = mean_long + deltalong,
+                   y = mean_lat, yend = mean_lat + deltalat),
+               linetype = "dashed") +
+  geom_segment(aes(x = longitude, xend = longitude + dlong,
+                   y = latitude, yend = latitude +dlat),
+               linetype = "dotted") +
+  geom_point(aes(x = mean_long + w1dlong, y = mean_lat +w1dlat), shape = "square") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+```{r}
+dt <- 2
+
+distance_full <- distance[0,]
+
+for (i in unique(intdata$raceID)){
+  
+  temp <- intdata %>%
+    filter(raceID == i) %>%
+    arrange(program_number, trakus_index) %>%
+    mutate(prev_lat = ifelse(trakus_index <= dt, latitude, lag(latitude, dt)),
+           prev_long = ifelse(trakus_index <= dt, longitude, lag(longitude, dt)),
+           dlat = latitude - prev_lat,
+           dlong = longitude - prev_long) %>%
+    group_by(trakus_index, .drop = FALSE) %>%
+    mutate(mean_lat = mean(latitude),
+           mean_long = mean(longitude),
+           mean_dlat = mean(dlat),
+           mean_dlong = mean(dlong)) %>%
+    ungroup() %>%
+    mutate(deltalat = latitude - mean_lat,
+           deltalong = longitude - mean_long) %>%
+    rowwise() %>%
+    mutate(w1 = list(vector_proj_track(deltalat, deltalong, mean_dlat, mean_dlong)),
+           w2 = list(vector_proj_ortho(deltalat, deltalong, w1)),
+           w1dist = scalar_proj_track(deltalat, deltalong, mean_dlat, mean_dlong)) %>%
+    ungroup() %>%
+    mutate(meanqtr = case_when(mean_dlong > 0 & mean_dlat > 0 ~ "NE",
+                               mean_dlong < 0 & mean_dlat > 0 ~ "NW",
+                               mean_dlong < 0 & mean_dlat < 0 ~ "SW",
+                               mean_dlong > 0 & mean_dlat < 0 ~ "SE")) %>%
+    rowwise() %>%
+    mutate(orthoqtr = case_when(w2[[2]] > 0 & w2[[1]] > 0 ~ "NE",
+                               w2[[2]] < 0 & w2[[1]] > 0 ~ "NW",
+                               w2[[2]] < 0 & w2[[1]] < 0 ~ "SW",
+                               w2[[2]] > 0 & w2[[1]] < 0 ~ "SE")) %>%
+    mutate(distacross = sqrt(w2[[1]]^2 + w2[[2]]^2),
+           w1_lat = w1[[1]],
+           w1_long = w1[[2]],
+           w2_lat = w2[[1]],
+           w2_long = w2[[2]]) %>%
+    ungroup() %>%
+    mutate(left = case_when(meanqtr == "NE" & orthoqtr == "NW" ~ TRUE,
+                            meanqtr == "NW" & orthoqtr == "SW" ~ TRUE,
+                            meanqtr == "SW" & orthoqtr == "SE" ~ TRUE,
+                            meanqtr == "SE" & orthoqtr == "NE" ~ TRUE, 
+                            T ~ FALSE),
+           distacross = ifelse(left, distacross, 0 - distacross)) %>%
+    group_by(trakus_index) %>%
+    mutate(currentpos = rank(desc(w1dist))) %>%
+    ungroup() %>%
+    mutate(dist_travelled = euclid_dist(prev_lat, prev_long, latitude, longitude),
+           speed = dist_travelled / (dt/4),
+           dist_race = euclid_dist(mean_lat + w1_lat, mean_long + w1_long, mean_lat, mean_long),
+           dist_race = ifelse(w1dist < 0, 0 - dist_race, dist_race),
+           dist_across = euclid_dist(mean_lat + w2_lat, mean_long + w2_long, mean_lat, mean_long),
+           dist_across = ifelse(distacross < 0, 0 - dist_across, dist_across)) %>%
+    group_by(raceID, program_number) %>%
+    mutate(cumdist_travelled = cumsum(dist_travelled)) %>%
+    ungroup() %>%
+    select(raceID, program_number, trakus_index, currentpos, dist_travelled, cumdist_travelled, speed, dist_race, dist_across)
+  
+  distance_full <- rbind(distance_full, temp)
+  
+}
+```
+
+```{r}
+write_csv(distance_full, "Data/Horse_Relative_Location.csv")
+```
+
+```{r}
+horsevect <- unique(distance_full$program_number)
+maxbehind <- 2
+maxacross <- 1
+
+wide_distance <- distance_full %>%
+  select(-4:-7) %>%
+  pivot_wider(names_from = program_number, names_prefix = "horse_", values_from = 4:5)
+
+draft_data <- wide_distance
+
+for (i in horsevect){
+  intname <- paste0("draft_horse_", i)
+  racename <- paste0("dist_race_horse_", i)
+  acrossname <- paste0("dist_across_horse_", i)
+  
+  racenames_other <- paste0("dist_race_horse_", horsevect)
+  racenames_other <- racenames_other[racenames_other != racename]
+  diffracenames <- paste0("diff.", racenames_other)
+  
+  acrossnames_other <- paste0("dist_across_horse_", horsevect)
+  acrossnames_other <- acrossnames_other[acrossnames_other != acrossname]
+  
+  tempdata <- wide_distance %>%
+    mutate(.data[[racename]] - across(all_of(racenames_other), .names = "diff.{col}"),
+           .data[[acrossname]] - across(all_of(acrossnames_other), .names = "diff.{col}"),
+           across(contains("diff.dist_race"), ~.x < 0 & .x > -maxbehind, TRUE, FALSE),
+           across(contains("diff.dist_across"), ~.x > -maxacross & .x < maxacross, TRUE, FALSE))
+  
+  for (j in horsevect[horsevect != i]) {
+    intdraftname <- paste0("drafting_from_", j)
+    racecol <- paste0("diff.dist_race_horse_", j)
+    acrosscol <- paste0("diff.dist_across_horse_", j)
+    
+    tempdata <- tempdata %>%
+      mutate({{intdraftname}} := .data[[racecol]] * .data[[acrosscol]])
+    
+  }
+
+  
+  tempdata <- tempdata %>%
+    mutate({{intname}} := across(starts_with("drafting_from")) %>% rowSums(na.rm = TRUE),
+           {{intname}} := ifelse(.data[[intname]] > 0, TRUE, FALSE))
+  
+  draft_data <- cbind(draft_data, tempdata[intname])
+
+}
+
+draft_time_reset <- function() {
+  function(x) {
+    x <- ifelse(is.na(x), 0, as.double(x))
+    accumulate(x, ~if_else(.y == 0, .y, .x + .y))
+  }
+}
+
+drafting <- draft_data %>%
+  select(raceID, trakus_index, contains("draft")) %>%
+  pivot_longer(cols = starts_with("draft"), names_prefix = "draft_horse_", names_to = "program_number", values_to = "Draft") %>%
+  arrange(raceID, program_number, trakus_index) %>%
+  group_by(raceID, program_number) %>%
+  mutate(draft_time = draft_time_reset()(Draft))
+
+
+
+drafting <- drafting %>%
+  right_join(select(intdata, raceID, program_number, trakus_index))
+
+write_csv(drafting, "Data/drafting.csv")
+```
